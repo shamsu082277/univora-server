@@ -5,7 +5,7 @@ import "dotenv/config";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "better-auth/adapters/mongodb";
-import { jwt } from "better-auth/plugins";
+import { jwt, bearer } from "better-auth/plugins";
 import { toNodeHandler } from "better-auth/node";
 import { z } from "zod";
 
@@ -103,6 +103,7 @@ export const auth = betterAuth({
         },
       },
     }),
+    bearer(),
   ],
 });
 
