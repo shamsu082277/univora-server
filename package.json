@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "seed": "node scripts/seed-events.js",
+    "clean:demo": "node scripts/clean-demo-events.js"
   },
   "keywords": [
     "express",
