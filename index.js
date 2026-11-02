@@ -107,12 +107,6 @@ export const auth = betterAuth({
   ],
 });
 
-// Better Auth Routes mounted BEFORE express.json() to prevent stream consumption
-app.all(["/api/auth", "/api/auth/{*splat}"], toNodeHandler(auth));
-
-// Express body parser for all other REST APIs
-app.use(express.json());
-
 // ==========================================
 // 4. JWT Verification Middleware (jose)
 // ==========================================
@@ -124,8 +118,8 @@ export const verifyToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).send({
-      message: "Unauthorized access",
+    return res.status(401).json({
+      message: "Unauthorized access: Bearer token is missing",
     });
   }
 
@@ -140,6 +134,8 @@ export const verifyToken = async (req, res, next) => {
     req.user = {
       ...payload,
       id: payload.sub || payload.id,
+      name: payload.name,
+      email: payload.email,
     };
 
     next();
@@ -151,6 +147,8 @@ export const verifyToken = async (req, res, next) => {
         req.user = {
           ...verified.payload,
           id: verified.payload.sub || verified.payload.id,
+          name: verified.payload.name,
+          email: verified.payload.email,
         };
         return next();
       }
@@ -158,11 +156,60 @@ export const verifyToken = async (req, res, next) => {
       // Fall through to 401
     }
 
-    return res.status(401).send({
-      message: "Unauthorized access",
+    return res.status(401).json({
+      message: "Unauthorized access: Invalid or expired token",
     });
   }
 };
+
+// ==========================================
+// Protected Authentication Test Endpoint
+// GET /api/auth/me
+// ==========================================
+app.get(["/api/auth/me", "/auth/me"], verifyToken, async (req, res) => {
+  try {
+    let name = req.user.name;
+    let email = req.user.email;
+
+    if (!name || !email) {
+      let dbUser = null;
+      if (ObjectId.isValid(req.user.id)) {
+        dbUser = await usersCollection.findOne({ _id: new ObjectId(req.user.id) });
+      }
+      if (!dbUser) {
+        dbUser = await usersCollection.findOne({ _id: req.user.id });
+      }
+      if (dbUser) {
+        name = name || dbUser.name;
+        email = email || dbUser.email;
+      }
+    }
+
+    return res.status(200).json({
+      id: req.user.id,
+      name: name || "User",
+      email: email || "",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: "Internal server error while resolving user profile",
+    });
+  }
+});
+
+// Better Auth Routes mounted BEFORE express.json() to prevent stream consumption
+app.all(["/api/auth", "/api/auth/{*splat}"], toNodeHandler(auth));
+
+// Express body parser for all other REST APIs
+app.use(express.json());
+
+// Normalize /api prefix for REST endpoints so both /api/events and /events work
+app.use((req, res, next) => {
+  if (req.url.startsWith("/api/") && !req.url.startsWith("/api/auth")) {
+    req.url = req.url.replace(/^\/api/, "");
+  }
+  next();
+});
 
 // ==========================================
 // 5. Admin Verification Middleware
