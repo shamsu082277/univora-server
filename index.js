@@ -259,6 +259,21 @@ function slugify(text) {
     .replace(/\-\-+/g, "-");
 }
 
+// ==========================================
+// Trusted Image Provider Whitelist & Validator
+// ==========================================
+import {
+  DEFAULT_TRUSTED_IMAGE_HOSTS,
+  getTrustedImageHosts,
+  validateImageUrl,
+} from "./utils/imageValidator.js";
+
+export {
+  DEFAULT_TRUSTED_IMAGE_HOSTS,
+  getTrustedImageHosts,
+  validateImageUrl,
+};
+
 function formatEventOutput(event, joinedUsers = []) {
   if (!event) return null;
   const id = event._id.toString();
@@ -275,7 +290,16 @@ function formatEventOutput(event, joinedUsers = []) {
       : event.eventDate || event.date || "";
 
   const categoryName = event.eventType || event.category || "Community Support";
-  const thumbnailImg = event.thumbnail || event.coverImage || "";
+  
+  // Safe image resolution for database protection:
+  // If an existing database record contains an untrusted hostname or invalid URL,
+  // safely assign the local SVG placeholder so the frontend never crashes.
+  const rawThumbnail = event.thumbnail || event.coverImage || "";
+  const imgValidation = validateImageUrl(rawThumbnail);
+  const safeThumbnail = imgValidation.isValid
+    ? imgValidation.sanitizedUrl
+    : "/images/event-placeholder.svg";
+
   const count = event.participantCount ?? event.registeredCount ?? 0;
   const organizerDisplay =
     event.organizerName || event.organizer || "Univora Organizer";
@@ -287,7 +311,8 @@ function formatEventOutput(event, joinedUsers = []) {
     id,
     _id: id,
     // Frontend compatibility (IEvent)
-    thumbnail: thumbnailImg,
+    thumbnail: safeThumbnail,
+    rawThumbnail: rawThumbnail,
     eventType: categoryName,
     eventDate: eventDateFormatted,
     participantCount: count,
@@ -299,7 +324,7 @@ function formatEventOutput(event, joinedUsers = []) {
         : event.joinedUsers || [],
 
     // Backend compatibility
-    coverImage: thumbnailImg,
+    coverImage: safeThumbnail,
     category: categoryName,
     date: eventDateFormatted,
     registeredCount: count,
@@ -549,7 +574,21 @@ app.post("/events", verifyToken, async (req, res) => {
           };
 
     const category = parsed.eventType || parsed.category || "Community Support";
-    const coverImage = parsed.thumbnail || parsed.coverImage || "";
+    const rawImage = parsed.thumbnail || parsed.coverImage || "";
+
+    // Server-side Image URL Validation (HTTPS & Trusted Whitelist)
+    const imgValidation = validateImageUrl(rawImage);
+    if (!imgValidation.isValid) {
+      return res.status(400).send({
+        message: imgValidation.error,
+        errors: {
+          thumbnail: [imgValidation.error],
+          coverImage: [imgValidation.error],
+        },
+      });
+    }
+
+    const coverImage = imgValidation.sanitizedUrl;
     const rawDate = parsed.eventDate || parsed.date || new Date();
     const dateObj = new Date(rawDate);
     const dateString = isNaN(dateObj.getTime())
@@ -666,8 +705,18 @@ app.patch("/events/:id", verifyToken, async (req, res) => {
     }
     if (allowedUpdates.thumbnail || allowedUpdates.coverImage) {
       const thumb = allowedUpdates.thumbnail || allowedUpdates.coverImage;
-      allowedUpdates.coverImage = thumb;
-      allowedUpdates.thumbnail = thumb;
+      const imgValidation = validateImageUrl(thumb);
+      if (!imgValidation.isValid) {
+        return res.status(400).send({
+          message: imgValidation.error,
+          errors: {
+            thumbnail: [imgValidation.error],
+            coverImage: [imgValidation.error],
+          },
+        });
+      }
+      allowedUpdates.coverImage = imgValidation.sanitizedUrl;
+      allowedUpdates.thumbnail = imgValidation.sanitizedUrl;
     }
     if (allowedUpdates.capacity) {
       allowedUpdates.capacity = Number(allowedUpdates.capacity);
