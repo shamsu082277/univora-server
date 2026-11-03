@@ -259,7 +259,7 @@ function slugify(text) {
     .replace(/\-\-+/g, "-");
 }
 
-function formatEventOutput(event) {
+function formatEventOutput(event, joinedUsers = []) {
   if (!event) return null;
   const id = event._id.toString();
   const locationString =
@@ -269,17 +269,48 @@ function formatEventOutput(event) {
         "TBD"
       : event.location || "TBD";
 
+  const eventDateFormatted =
+    event.date instanceof Date
+      ? event.date.toISOString().split("T")[0]
+      : event.eventDate || event.date || "";
+
+  const categoryName = event.eventType || event.category || "Community Support";
+  const thumbnailImg = event.thumbnail || event.coverImage || "";
+  const count = event.participantCount ?? event.registeredCount ?? 0;
+  const organizerDisplay =
+    event.organizerName || event.organizer || "Univora Organizer";
+  const organizerEmail = event.organizerEmail || "";
+  const organizerId = event.organizerId || "";
+
   return {
     ...event,
     id,
     _id: id,
-    thumbnail: event.coverImage || event.thumbnail || "",
-    coverImage: event.coverImage || event.thumbnail || "",
+    // Frontend compatibility (IEvent)
+    thumbnail: thumbnailImg,
+    eventType: categoryName,
+    eventDate: eventDateFormatted,
+    participantCount: count,
+    organizerEmail,
+    organizerId,
+    joinedUsers:
+      joinedUsers && joinedUsers.length > 0
+        ? joinedUsers
+        : event.joinedUsers || [],
+
+    // Backend compatibility
+    coverImage: thumbnailImg,
+    category: categoryName,
+    date: eventDateFormatted,
+    registeredCount: count,
+    attendeesCount: count,
     location: locationString,
-    locationDetails: typeof event.location === "object" ? event.location : { venue: locationString, city: "" },
-    attendeesCount: event.registeredCount ?? 0,
-    organizer: event.organizerName || "Univora Organizer",
-    date: event.date instanceof Date ? event.date.toISOString().split("T")[0] : event.date,
+    locationDetails:
+      typeof event.location === "object"
+        ? event.location
+        : { venue: locationString, city: "" },
+    organizer: organizerDisplay,
+    organizerName: organizerDisplay,
   };
 }
 
@@ -287,13 +318,10 @@ const eventInputSchema = z.object({
   title: z.string().min(3, "Title must be at least 3 characters").max(150),
   description: z.string().min(10, "Description must be at least 10 characters"),
   shortDescription: z.string().optional(),
-  category: z.enum([
-    "Community Support",
-    "Environmental Care",
-    "Donation & Charity",
-    "Education & Awareness",
-  ]),
-  coverImage: z.string().url("Cover image must be a valid URL"),
+  category: z.string().optional(),
+  eventType: z.string().optional(),
+  coverImage: z.string().optional(),
+  thumbnail: z.string().optional(),
   location: z.union([
     z.string().min(2, "Location is required"),
     z.object({
@@ -302,7 +330,8 @@ const eventInputSchema = z.object({
       city: z.string().optional(),
     }),
   ]),
-  date: z.union([z.string(), z.date()]),
+  date: z.union([z.string(), z.date()]).optional(),
+  eventDate: z.union([z.string(), z.date()]).optional(),
   startTime: z.string().optional(),
   endTime: z.string().optional(),
   capacity: z.coerce.number().int().positive("Capacity must be greater than 0").default(100),
@@ -335,23 +364,28 @@ app.get("/events", async (req, res) => {
     }
 
     if (category && category !== "All") {
-      query.category = category;
+      query.$or = [{ category: category }, { eventType: category }];
     }
 
     if (city) {
-      query.$or = [
+      const cityQuery = [
         { "location.city": { $regex: city, $options: "i" } },
         { location: { $regex: city, $options: "i" } },
       ];
+      if (query.$or) {
+        query.$and = [{ $or: query.$or }, { $or: cityQuery }];
+        delete query.$or;
+      } else {
+        query.$or = cityQuery;
+      }
     }
 
     const sortOption = {};
-    if (sort === "asc" || sort === "date-asc") {
-      sortOption.date = 1;
-    } else if (sort === "desc" || sort === "date-desc") {
+    if (sort === "recent" || sort === "desc" || sort === "date-desc") {
       sortOption.date = -1;
     } else {
-      sortOption.date = 1; // Default to nearest upcoming events
+      // Default to upcoming / date-asc
+      sortOption.date = 1;
     }
 
     const skip = (Number(page) - 1) * Number(limit);
@@ -363,7 +397,7 @@ app.get("/events", async (req, res) => {
       .limit(Number(limit))
       .toArray();
 
-    const events = rawEvents.map(formatEventOutput);
+    const events = rawEvents.map((e) => formatEventOutput(e));
 
     res.send({
       events,
@@ -377,8 +411,8 @@ app.get("/events", async (req, res) => {
   }
 });
 
-// GET /featured-events - Top 6 published events
-app.get("/featured-events", async (req, res) => {
+// GET /featured-events and /events/recent - Top 6 published events
+app.get(["/featured-events", "/events/recent"], async (req, res) => {
   try {
     const rawEvents = await eventsCollection
       .find({ status: "published" })
@@ -386,7 +420,7 @@ app.get("/featured-events", async (req, res) => {
       .limit(6)
       .toArray();
 
-    res.send(rawEvents.map(formatEventOutput));
+    res.send(rawEvents.map((e) => formatEventOutput(e)));
   } catch (error) {
     console.error("Error fetching featured events:", error);
     res.status(500).send({ message: "Failed to fetch featured events" });
@@ -437,7 +471,12 @@ app.get("/events/slug/:slug", async (req, res) => {
       return res.status(404).send({ message: "Event not found" });
     }
 
-    res.send(formatEventOutput(event));
+    const registrations = await registrationsCollection
+      .find({ eventId: event._id })
+      .toArray();
+    const joinedUsers = registrations.flatMap((r) => [r.userId, r.userEmail].filter(Boolean));
+
+    res.send(formatEventOutput(event, joinedUsers));
   } catch (error) {
     console.error("Error finding event by slug:", error);
     res.status(500).send({ message: "Server error retrieving event" });
@@ -457,7 +496,12 @@ app.get("/events/:id", async (req, res) => {
       return res.status(404).send({ message: "Event not found" });
     }
 
-    res.send(formatEventOutput(event));
+    const registrations = await registrationsCollection
+      .find({ eventId: new ObjectId(id) })
+      .toArray();
+    const joinedUsers = registrations.flatMap((r) => [r.userId, r.userEmail].filter(Boolean));
+
+    res.send(formatEventOutput(event, joinedUsers));
   } catch (error) {
     console.error("Error finding event by ID:", error);
     res.status(500).send({ message: "Server error retrieving event" });
@@ -484,11 +528,13 @@ app.post("/events", verifyToken, async (req, res) => {
     const baseSlug = slugify(parsed.title);
     const uniqueSlug = `${baseSlug}-${Date.now().toString(36)}`;
 
-    // Extract user display name from token or database
+    // Extract user display name & email from token or database
     let organizerName = req.user.name || "Univora Volunteer";
-    if (!req.user.name && ObjectId.isValid(req.user.id)) {
+    let organizerEmail = req.user.email || "";
+    if ((!req.user.name || !req.user.email) && ObjectId.isValid(req.user.id)) {
       const u = await usersCollection.findOne({ _id: new ObjectId(req.user.id) });
       if (u?.name) organizerName = u.name;
+      if (u?.email) organizerEmail = u.email;
     }
 
     const locationObj =
@@ -502,20 +548,33 @@ app.post("/events", verifyToken, async (req, res) => {
               : parsed.location,
           };
 
+    const category = parsed.eventType || parsed.category || "Community Support";
+    const coverImage = parsed.thumbnail || parsed.coverImage || "";
+    const rawDate = parsed.eventDate || parsed.date || new Date();
+    const dateObj = new Date(rawDate);
+    const dateString = isNaN(dateObj.getTime())
+      ? new Date().toISOString().split("T")[0]
+      : dateObj.toISOString().split("T")[0];
+
     const newEvent = {
       title: parsed.title,
       slug: uniqueSlug,
       description: parsed.description,
       shortDescription: parsed.shortDescription || parsed.description.slice(0, 160),
-      category: parsed.category,
-      coverImage: parsed.coverImage,
+      category: category,
+      eventType: category,
+      coverImage: coverImage,
+      thumbnail: coverImage,
       location: locationObj,
-      date: new Date(parsed.date),
+      date: dateObj,
+      eventDate: dateString,
       startTime: parsed.startTime || "09:00 AM",
       endTime: parsed.endTime || "05:00 PM",
       capacity: parsed.capacity,
       registeredCount: 0,
+      participantCount: 0,
       organizerId: req.user.id,
+      organizerEmail: organizerEmail,
       organizerName: organizerName,
       status: parsed.status || "published",
       tags: parsed.tags || [],
@@ -536,15 +595,20 @@ app.post("/events", verifyToken, async (req, res) => {
   }
 });
 
-// GET /my-events - Get events created by authenticated user
-app.get("/my-events", verifyToken, async (req, res) => {
+// GET /my-events and /events/my-events - Get events created by authenticated user
+app.get(["/my-events", "/events/my-events"], verifyToken, async (req, res) => {
   try {
     const rawEvents = await eventsCollection
-      .find({ organizerId: req.user.id })
+      .find({
+        $or: [
+          { organizerId: req.user.id },
+          ...(req.user.email ? [{ organizerEmail: req.user.email }] : []),
+        ],
+      })
       .sort({ createdAt: -1 })
       .toArray();
 
-    res.send(rawEvents.map(formatEventOutput));
+    res.send(rawEvents.map((e) => formatEventOutput(e)));
   } catch (error) {
     console.error("Error fetching my events:", error);
     res.status(500).send({ message: "Failed to fetch your events" });
@@ -565,7 +629,9 @@ app.patch("/events/:id", verifyToken, async (req, res) => {
     }
 
     // Check ownership or admin status
-    const isOwner = event.organizerId === req.user.id;
+    const isOwner =
+      event.organizerId === req.user.id ||
+      (req.user.email && event.organizerEmail === req.user.email);
     const isAdmin = req.user.role === "admin";
 
     if (!isOwner && !isAdmin) {
@@ -578,14 +644,30 @@ app.patch("/events/:id", verifyToken, async (req, res) => {
     const {
       _id,
       organizerId,
+      organizerEmail,
       registeredCount,
+      participantCount,
       createdAt,
       slug,
       ...allowedUpdates
     } = req.body;
 
-    if (allowedUpdates.date) {
-      allowedUpdates.date = new Date(allowedUpdates.date);
+    if (allowedUpdates.eventDate || allowedUpdates.date) {
+      const d = new Date(allowedUpdates.eventDate || allowedUpdates.date);
+      allowedUpdates.date = d;
+      allowedUpdates.eventDate = isNaN(d.getTime())
+        ? new Date().toISOString().split("T")[0]
+        : d.toISOString().split("T")[0];
+    }
+    if (allowedUpdates.eventType || allowedUpdates.category) {
+      const cat = allowedUpdates.eventType || allowedUpdates.category;
+      allowedUpdates.category = cat;
+      allowedUpdates.eventType = cat;
+    }
+    if (allowedUpdates.thumbnail || allowedUpdates.coverImage) {
+      const thumb = allowedUpdates.thumbnail || allowedUpdates.coverImage;
+      allowedUpdates.coverImage = thumb;
+      allowedUpdates.thumbnail = thumb;
     }
     if (allowedUpdates.capacity) {
       allowedUpdates.capacity = Number(allowedUpdates.capacity);
@@ -631,7 +713,9 @@ app.delete("/events/:id", verifyToken, async (req, res) => {
       return res.status(404).send({ message: "Event not found" });
     }
 
-    const isOwner = event.organizerId === req.user.id;
+    const isOwner =
+      event.organizerId === req.user.id ||
+      (req.user.email && event.organizerEmail === req.user.email);
     const isAdmin = req.user.role === "admin";
 
     if (!isOwner && !isAdmin) {
@@ -647,6 +731,7 @@ app.delete("/events/:id", verifyToken, async (req, res) => {
     await registrationsCollection.deleteMany({ eventId: new ObjectId(id) });
 
     res.send({
+      success: true,
       message: "Event and associated registrations deleted successfully",
     });
   } catch (error) {
@@ -679,8 +764,8 @@ app.post("/events/:id/join", verifyToken, async (req, res) => {
     }
 
     // Check capacity
-    const currentCount = event.registeredCount || 0;
-    if (currentCount >= event.capacity) {
+    const currentCount = event.participantCount ?? event.registeredCount ?? 0;
+    if (event.capacity && currentCount >= event.capacity) {
       return res.status(400).send({
         message: "This event has reached its maximum volunteer capacity",
       });
@@ -689,7 +774,10 @@ app.post("/events/:id/join", verifyToken, async (req, res) => {
     // Check existing registration
     const existingRegistration = await registrationsCollection.findOne({
       eventId: new ObjectId(id),
-      userId: req.user.id,
+      $or: [
+        { userId: req.user.id },
+        ...(req.user.email ? [{ userEmail: req.user.email }] : []),
+      ],
     });
 
     if (existingRegistration) {
@@ -698,22 +786,27 @@ app.post("/events/:id/join", verifyToken, async (req, res) => {
       });
     }
 
-    // Atomic update to avoid race conditions
+    // Atomic update to increment participantCount
+    const updateQuery = {
+      _id: new ObjectId(id),
+    };
+    if (event.capacity) {
+      updateQuery.$or = [
+        { participantCount: { $lt: event.capacity } },
+        { registeredCount: { $lt: event.capacity } },
+        { participantCount: { $exists: false } },
+      ];
+    }
+
     const updateResult = await eventsCollection.updateOne(
+      updateQuery,
       {
-        _id: new ObjectId(id),
-        $or: [
-          { registeredCount: { $lt: event.capacity } },
-          { registeredCount: { $exists: false } },
-        ],
-      },
-      {
-        $inc: { registeredCount: 1 },
+        $inc: { participantCount: 1, registeredCount: 1 },
         $set: { updatedAt: new Date() },
       }
     );
 
-    if (updateResult.modifiedCount === 0) {
+    if (event.capacity && updateResult.modifiedCount === 0) {
       return res.status(400).send({
         message: "Event has just reached full capacity",
       });
@@ -730,11 +823,14 @@ app.post("/events/:id/join", verifyToken, async (req, res) => {
     };
 
     const result = await registrationsCollection.insertOne(registrationRecord);
+    const updatedEvent = await eventsCollection.findOne({ _id: new ObjectId(id) });
 
     res.status(201).send({
+      success: true,
       message: "Successfully joined the event!",
       registrationId: result.insertedId,
       registration: registrationRecord,
+      event: formatEventOutput(updatedEvent),
     });
   } catch (error) {
     if (error.code === 11000) {
@@ -757,7 +853,10 @@ app.delete("/events/:id/join", verifyToken, async (req, res) => {
 
     const registration = await registrationsCollection.findOne({
       eventId: new ObjectId(id),
-      userId: req.user.id,
+      $or: [
+        { userId: req.user.id },
+        ...(req.user.email ? [{ userEmail: req.user.email }] : []),
+      ],
     });
 
     if (!registration) {
@@ -769,16 +868,20 @@ app.delete("/events/:id/join", verifyToken, async (req, res) => {
     // Delete registration
     await registrationsCollection.deleteOne({ _id: registration._id });
 
-    // Decrement registeredCount
+    // Decrement count
     await eventsCollection.updateOne(
-      { _id: new ObjectId(id), registeredCount: { $gt: 0 } },
       {
-        $inc: { registeredCount: -1 },
+        _id: new ObjectId(id),
+        $or: [{ participantCount: { $gt: 0 } }, { registeredCount: { $gt: 0 } }],
+      },
+      {
+        $inc: { participantCount: -1, registeredCount: -1 },
         $set: { updatedAt: new Date() },
       }
     );
 
     res.send({
+      success: true,
       message: "Your registration has been cancelled successfully",
     });
   } catch (error) {
@@ -800,7 +903,9 @@ app.get("/events/:id/registrations", verifyToken, async (req, res) => {
       return res.status(404).send({ message: "Event not found" });
     }
 
-    const isOwner = event.organizerId === req.user.id;
+    const isOwner =
+      event.organizerId === req.user.id ||
+      (req.user.email && event.organizerEmail === req.user.email);
     const isAdmin = req.user.role === "admin";
 
     if (!isOwner && !isAdmin) {
@@ -827,45 +932,54 @@ app.get("/events/:id/registrations", verifyToken, async (req, res) => {
   }
 });
 
-// GET /my-joined-events - List of events authenticated user has joined
-app.get("/my-joined-events", verifyToken, async (req, res) => {
-  try {
-    const userRegistrations = await registrationsCollection
-      .find({ userId: req.user.id })
-      .sort({ registeredAt: -1 })
-      .toArray();
+// GET /my-joined-events, /events/my-joined - List of events authenticated user has joined
+app.get(
+  ["/my-joined-events", "/events/my-joined", "/events/my-joined-events"],
+  verifyToken,
+  async (req, res) => {
+    try {
+      const userRegistrations = await registrationsCollection
+        .find({
+          $or: [
+            { userId: req.user.id },
+            ...(req.user.email ? [{ userEmail: req.user.email }] : []),
+          ],
+        })
+        .sort({ registeredAt: -1 })
+        .toArray();
 
-    if (!userRegistrations.length) {
-      return res.send([]);
+      if (!userRegistrations.length) {
+        return res.send([]);
+      }
+
+      const eventIds = userRegistrations.map((r) => r.eventId);
+      const events = await eventsCollection
+        .find({ _id: { $in: eventIds } })
+        .toArray();
+
+      const registrationMap = new Map();
+      userRegistrations.forEach((r) => {
+        registrationMap.set(r.eventId.toString(), r);
+      });
+
+      const enrichedEvents = events.map((event) => {
+        const formatted = formatEventOutput(event);
+        const reg = registrationMap.get(event._id.toString());
+        return {
+          ...formatted,
+          registrationId: reg?._id,
+          registeredAt: reg?.registeredAt,
+          registrationStatus: reg?.status || "registered",
+        };
+      });
+
+      res.send(enrichedEvents);
+    } catch (error) {
+      console.error("Error fetching joined events:", error);
+      res.status(500).send({ message: "Failed to fetch your joined events" });
     }
-
-    const eventIds = userRegistrations.map((r) => r.eventId);
-    const events = await eventsCollection
-      .find({ _id: { $in: eventIds } })
-      .toArray();
-
-    const registrationMap = new Map();
-    userRegistrations.forEach((r) => {
-      registrationMap.set(r.eventId.toString(), r);
-    });
-
-    const enrichedEvents = events.map((event) => {
-      const formatted = formatEventOutput(event);
-      const reg = registrationMap.get(event._id.toString());
-      return {
-        ...formatted,
-        registrationId: reg?._id,
-        registeredAt: reg?.registeredAt,
-        registrationStatus: reg?.status || "registered",
-      };
-    });
-
-    res.send(enrichedEvents);
-  } catch (error) {
-    console.error("Error fetching joined events:", error);
-    res.status(500).send({ message: "Failed to fetch your joined events" });
   }
-});
+);
 
 // ==========================================
 // 10. User Profile APIs
