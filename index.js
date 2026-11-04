@@ -18,15 +18,43 @@ const BETTER_AUTH_URL = process.env.BETTER_AUTH_URL || `http://localhost:${PORT}
 // ==========================================
 // 1. CORS Configuration
 // ==========================================
-app.use(
-  cors({
-    origin: [FRONTEND_URI, "http://localhost:3000", "http://127.0.0.1:3000"],
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "Cookie", "x-requested-with"],
-    exposedHeaders: ["set-auth-jwt"],
-  })
-);
+const ALLOWED_ORIGINS = [
+  "https://univora-pi.vercel.app",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  ...(process.env.FRONTEND_URI ? [process.env.FRONTEND_URI.replace(/\/+$/, "")] : []),
+];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow non-browser requests (e.g. server-to-server, curl, mobile apps)
+    if (!origin) {
+      return callback(null, true);
+    }
+    const cleanOrigin = origin.replace(/\/+$/, "");
+    if (ALLOWED_ORIGINS.includes(cleanOrigin) || cleanOrigin === "http://127.0.0.1:3000") {
+      return callback(null, true);
+    }
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Cookie",
+    "x-requested-with",
+    "Accept",
+  ],
+  exposedHeaders: ["set-auth-jwt"],
+  optionsSuccessStatus: 200,
+};
+
+// CORS middleware MUST run before all other routes and handlers
+app.use(cors(corsOptions));
+
+// Explicit OPTIONS preflight handler for all routes in Express 5
+app.options(["/", "/{*splat}"], cors(corsOptions));
 
 // ==========================================
 // 2. MongoDB Connection
@@ -67,12 +95,23 @@ try {
 // ==========================================
 // 3. Better Auth Configuration
 // ==========================================
+const googleClientId = process.env.GOOGLE_CLIENT_ID?.trim() || "";
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim() || "";
+
 const socialProvidersConfig = {};
-if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+if (googleClientId && googleClientSecret) {
   socialProvidersConfig.google = {
-    clientId: process.env.GOOGLE_CLIENT_ID,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    clientId: googleClientId,
+    clientSecret: googleClientSecret,
   };
+  console.log(
+    "✓ Google OAuth provider configured successfully with Client ID:",
+    googleClientId.slice(0, 16) + "..."
+  );
+} else {
+  console.warn(
+    "⚠ Google OAuth provider NOT configured. Ensure GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are set in .env"
+  );
 }
 
 export const auth = betterAuth({
@@ -81,7 +120,21 @@ export const auth = betterAuth({
   }),
   baseURL: BETTER_AUTH_URL,
   secret: process.env.BETTER_AUTH_SECRET || "univora_default_secret_key_change_in_production_12345",
-  trustedOrigins: [FRONTEND_URI, "http://localhost:3000", "http://127.0.0.1:3000"],
+  trustedOrigins: [
+    "https://univora-pi.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://univora-server.vercel.app",
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+    ...(process.env.FRONTEND_URI ? [process.env.FRONTEND_URI.replace(/\/+$/, "")] : []),
+  ],
+  advanced: {
+    defaultCookieAttributes: {
+      sameSite: (process.env.NODE_ENV === "production" || process.env.VERCEL) ? "none" : "lax",
+      secure: (process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL)),
+    },
+  },
   emailAndPassword: {
     enabled: true,
   },
@@ -162,39 +215,27 @@ export const verifyToken = async (req, res, next) => {
   }
 };
 
-// ==========================================
-// Protected Authentication Test Endpoint
-// GET /api/auth/me
-// ==========================================
-app.get(["/api/auth/me", "/auth/me"], verifyToken, async (req, res) => {
-  try {
-    let name = req.user.name;
-    let email = req.user.email;
-
-    if (!name || !email) {
-      let dbUser = null;
-      if (ObjectId.isValid(req.user.id)) {
-        dbUser = await usersCollection.findOne({ _id: new ObjectId(req.user.id) });
-      }
-      if (!dbUser) {
-        dbUser = await usersCollection.findOne({ _id: req.user.id });
-      }
-      if (dbUser) {
-        name = name || dbUser.name;
-        email = email || dbUser.email;
+// Ensure Better Auth OAuth redirects always land on FRONTEND_URI (port 3000), not the API server (port 5000)
+app.use((req, res, next) => {
+  const originalSetHeader = res.setHeader;
+  res.setHeader = function (name, value) {
+    if (
+      typeof name === "string" &&
+      name.toLowerCase() === "location" &&
+      typeof value === "string"
+    ) {
+      if (
+        value === BETTER_AUTH_URL ||
+        value === `${BETTER_AUTH_URL}/` ||
+        value.startsWith(`${BETTER_AUTH_URL}/?`) ||
+        value.startsWith(`${BETTER_AUTH_URL}/#`)
+      ) {
+        value = value.replace(BETTER_AUTH_URL, FRONTEND_URI);
       }
     }
-
-    return res.status(200).json({
-      id: req.user.id,
-      name: name || "User",
-      email: email || "",
-    });
-  } catch (error) {
-    return res.status(500).json({
-      message: "Internal server error while resolving user profile",
-    });
-  }
+    return originalSetHeader.apply(this, [name, value]);
+  };
+  next();
 });
 
 // Better Auth Routes mounted BEFORE express.json() to prevent stream consumption
@@ -368,12 +409,12 @@ const eventInputSchema = z.object({
 // 7. Public Event APIs
 // ==========================================
 
-// GET / - Root Health Check
+// GET / - Root Health Check & API Entry Point
 app.get("/", (req, res) => {
-  res.send({
-    status: "ok",
-    service: "Univora API Server",
-    time: new Date().toISOString(),
+  return res.status(200).json({
+    success: true,
+    message: "Univora server is running successfully!",
+    documentation: "For available API endpoints, please visit /api/events",
   });
 });
 
@@ -1181,9 +1222,36 @@ app.get("/admin/events", verifyToken, verifyAdmin, async (req, res) => {
 });
 
 // ==========================================
-// 12. Server Startup
+// 12. Centralized Error Handling Middleware (Preserves CORS)
 // ==========================================
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-  console.log(`Better Auth available at ${BETTER_AUTH_URL}/api/auth`);
+app.use((err, req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    const cleanOrigin = origin.replace(/\/+$/, "");
+    if (ALLOWED_ORIGINS.includes(cleanOrigin) || cleanOrigin === "http://127.0.0.1:3000") {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,Cookie,x-requested-with,Accept");
+    }
+  }
+
+  console.error("Express unhandled error:", err);
+  const status = err.status || err.statusCode || 500;
+  return res.status(status).json({
+    success: false,
+    message: err.message || "Internal server error",
+  });
 });
+
+// ==========================================
+// 13. Server Startup
+// ==========================================
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+    console.log(`Better Auth available at ${BETTER_AUTH_URL}/api/auth`);
+  });
+}
+
+export default app;
